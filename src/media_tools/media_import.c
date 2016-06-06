@@ -29,6 +29,9 @@
 #ifndef GPAC_DISABLE_AVILIB
 #include <gpac/internal/avilib.h>
 #endif
+#ifndef GPAC_DISABLE_MATROSKA
+#include <libavformat/avformat.h>
+#endif
 #ifndef GPAC_DISABLE_OGG
 #include <gpac/internal/ogg.h>
 #endif
@@ -2016,6 +2019,548 @@ exit:
 }
 #endif /*GPAC_DISABLE_AVILIB*/
 
+#ifndef GPAC_DISABLE_MATROSKA
+static GF_Err gf_import_matroska_video(GF_MediaImporter *import)
+{
+	AVFormatContext *iformat_ctx = NULL;
+	AVInputFormat	*iformat_inp = NULL;
+	AVDictionary	**opts = NULL;
+	u32             i, vstream;
+	AVCodecContext  *codec_ctx = NULL, *codec_ctx_origin = NULL;
+	AVCodec         *codec = NULL;
+	AVStream		*cur_stream = NULL;
+	AVFrame         *picture = NULL;
+	AVPacket        packet;
+	u32             frame_finished;
+	float           aspect_ratio;
+	u64				samp_offset, size, max_size, packet_offset;
+
+	FILE			*test;
+	GF_Err			e;
+	Bool			is_vfr, erase_pl, destroy_esd, is_packed, is_init, has_cts_offset;
+	Double			FPS;
+	GF_ISOSample *samp;
+	u32 num_samples, timescale, track, di, PL, max_b, nb_f, ref_frame, b_frames;
+	u32 nbI, nbP, nbB, nbDummy, nbNotCoded, dts_inc, cur_samp;
+	GF_M4VDecSpecInfo dsi;
+	GF_M4VParser *vparse;
+	s32 key;
+	u64 duration;
+	char *comp, *frame;
+
+	test = gf_fopen(import->in_name, "rb");
+	if (!test) return gf_import_message(import, GF_URL_ERROR, "Opening %s failed", import->in_name);
+	gf_fclose(test);
+
+	av_register_all();
+	avcodec_register_all();
+
+	// open the video file.
+	if (avformat_open_input(&iformat_ctx, import->in_name, iformat_inp, opts) != 0) {
+		gf_import_message(import, GF_NOT_SUPPORTED, "Video file %s cannot be opened. Format is not supported.", import->in_name);
+		e = GF_NON_COMPLIANT_BITSTREAM;
+		goto exit;
+	}
+
+	// retrieve stream information
+	if (avformat_find_stream_info(iformat_ctx, opts) < 0) {
+		gf_import_message(import, GF_STREAM_NOT_FOUND, "No media stream found in file %s.", import->in_name);
+		e = GF_STREAM_NOT_FOUND;
+		goto exit;
+	}
+
+	// find the first video stream
+	vstream = -1;
+	for (i = 0; i < iformat_ctx->nb_streams; i++)
+		if (iformat_ctx->streams[i]->codec->codec_type == AVMEDIA_TYPE_VIDEO) {
+			vstream = i;
+			break;
+		}
+	// if there is no video stream, there is nothing to do here.
+	if (vstream == -1) {
+		gf_import_message(import, GF_STREAM_NOT_FOUND, "No video stream found in file %s.", import->in_name);
+		e = GF_STREAM_NOT_FOUND;
+		goto exit;
+	}
+
+	// get a pointer to the codec context for the video stream
+	codec_ctx_origin = iformat_ctx->streams[vstream]->codec;
+
+	// find the proper decoder for the video stream. if we cannot decode, return.
+	codec = avcodec_find_decoder(codec_ctx_origin->codec_id);
+	if (codec == NULL) {
+		gf_import_message(import, GF_NOT_SUPPORTED, "Video format not supported - recompress the file first.");
+		e = GF_NOT_SUPPORTED;
+		goto exit;
+	}
+
+	// copy context
+	codec_ctx = avcodec_alloc_context3(codec);
+	if (avcodec_copy_context(codec_ctx, codec_ctx_origin) != 0) {
+		gf_import_message(import, GF_OUT_OF_MEM, "Out of memory. Cannot create codec context.");
+		e = GF_OUT_OF_MEM;
+		goto exit;
+	}
+
+	// open codec
+	if (avcodec_open2(codec_ctx, codec, opts) < 0) {
+		gf_import_message(import, GF_NOT_SUPPORTED, "Video format %s not supported - recompress the file first.", codec->long_name);
+		e = GF_NOT_SUPPORTED;
+		goto exit;
+	}
+
+	if (import->flags & GF_IMPORT_PROBE_ONLY) {
+		import->nb_tracks = 0;
+		for (i = 0; i < iformat_ctx->nb_streams; i++) {
+			cur_stream = iformat_ctx->streams[i];
+			if (cur_stream->codec->codec_type == AVMEDIA_TYPE_VIDEO) {
+				import->tk_info[i].track_num = i + 1;
+				import->tk_info[i].type = GF_ISOM_MEDIA_VISUAL;
+				import->tk_info[i].flags = GF_IMPORT_USE_DATAREF | GF_IMPORT_NO_FRAME_DROP | GF_IMPORT_OVERRIDE_FPS;
+				import->tk_info[i].video_info.FPS =
+					(double)(cur_stream->codec->framerate.num) /
+					(double)(cur_stream->codec->framerate.den);
+				import->tk_info[i].video_info.width = codec_ctx->width;
+				import->tk_info[i].video_info.height = codec_ctx->height;
+				import->tk_info[0].media_type = cur_stream->codec->codec_id;
+				import->nb_tracks++;
+			}
+			else if (cur_stream->codec->codec_type == AVMEDIA_TYPE_AUDIO) {
+				import->tk_info[i + 1].track_num = i + 1;
+				import->tk_info[i + 1].type = GF_ISOM_MEDIA_AUDIO;
+				import->tk_info[i + 1].flags = GF_IMPORT_USE_DATAREF;
+				import->tk_info[i + 1].audio_info.sample_rate = cur_stream->codec->sample_rate;
+				import->tk_info[i + 1].audio_info.nb_channels = cur_stream->codec->channels;
+				import->nb_tracks++;
+			}
+		}
+		e = GF_OK;
+		goto exit;
+	}
+
+	// Reza: Why we return from this function if trackID > 1? Because then it wouldn't be a video stream?
+	if (import->trackID > 1) {
+		e = GF_OK;
+		goto exit;
+	}
+
+	comp = codec->name;
+	//  Reza: For now I assume we support all the following video formats. 
+	//  In fact, if we reached here this means that we were able to find a 
+	//  decoder for the video stream inside the video file, so I guess we can 
+	// essentially remove this code. Am I right?
+	/*these are/should be OK*/
+	if (!stricmp(comp, "DIVX") || !stricmp(comp, "DX50")	/*DivX*/
+		|| !stricmp(comp, "XVID") /*XviD*/
+		|| !stricmp(comp, "3iv2") /*3ivX*/
+		|| !stricmp(comp, "fvfw") /*ffmpeg*/
+		|| !stricmp(comp, "NDIG") /*nero*/
+		|| !stricmp(comp, "MP4V") /*!! not tested*/
+		|| !stricmp(comp, "M4CC") /*Divio - not tested*/
+		|| !stricmp(comp, "PVMM") /*PacketVideo - not tested*/
+		|| !stricmp(comp, "SEDG") /*Samsung - not tested*/
+		|| !stricmp(comp, "RMP4") /*Sigma - not tested*/
+		|| !stricmp(comp, "MP43") /*not tested*/
+		|| !stricmp(comp, "FMP4") /*not tested*/
+		|| !stricmp(comp, "DIV3") /*not tested*/
+		|| !stricmp(comp, "DIV4") /*not tested*/
+		|| !stricmp(comp, "H264") /*not tested*/
+		|| !stricmp(comp, "X264") /*not tested*/
+		) {
+
+	}
+	else {
+		gf_import_message(import, GF_NOT_SUPPORTED, "Video format %s not supported - recompress the file first.", comp);
+		e = GF_NOT_SUPPORTED;
+		goto exit;
+	}
+
+	destroy_esd = GF_FALSE;
+	erase_pl = GF_FALSE;
+	frame = NULL;
+	cur_stream = iformat_ctx->streams[vstream];
+
+	// Reza: I guess these information are filled somewhere after probing the video. For now, for debug purposes, I'm filling them myself.
+	import->video_fps = (Double)(cur_stream->avg_frame_rate.num) / (Double)(cur_stream->avg_frame_rate.den);
+
+	// Reza: The duration is in milliseconds. The code from AVI import multiplies import->duration by FPS (see line 1620). So it seems it intends 
+	// to have the video duration in seconds. Am I right?
+	import->duration = cur_stream->duration / 1000000.0;
+
+	// Reza: The length of the video file is the maximum of length of video stream and audio stream. For now, I use the length of video file. 
+	// I also provide the code for the real video stream length here. Which one I should use?
+	// Reza: Question. Why import->duration is u32? Shouldn't it be a double?
+	import->duration = iformat_ctx->duration / 1000000.0;
+
+	// Code for 'exact' length of video stream (not the video file)
+	AVDictionary* m = cur_stream->metadata;
+	AVDictionaryEntry *tag = NULL;
+	Double ex_duration = 0;
+	while ((tag = av_dict_get(m, "", tag, AV_DICT_IGNORE_SUFFIX)))
+		if (stricmp("Duration", tag->key) == 0) {
+			const char *p = tag->value;
+			char tmp[16] = { 0 };
+			strncpy(tmp, p, 2);
+			ex_duration += 3600 * atoi(tmp);
+			strncpy(tmp, p + 3, 2);
+			ex_duration += 60 * atoi(tmp);
+			strncpy(tmp, p + 6, 2);
+			ex_duration += atoi(tmp);
+			strncpy(tmp, p + 9, strlen(p) - 9);
+			ex_duration += atoi(tmp) / pow(10, strlen(p) - 9);
+			import->duration = ex_duration;
+			break;
+		}
+
+	/*no auto frame-rate detection*/
+	if (import->video_fps == GF_IMPORT_AUTO_FPS)
+		import->video_fps = GF_IMPORT_DEFAULT_FPS;
+
+	if (import->video_fps) FPS = (Double)import->video_fps;
+	get_video_timing(FPS, &timescale, &dts_inc);
+	// Reza: So this duration is roughly number of frames. Right?
+	duration = (u64)(import->duration * FPS);
+
+	e = GF_OK;
+	max_size = 0;
+	samp_offset = 0;
+	frame = NULL;
+	num_samples = round(ex_duration * FPS);
+	samp = gf_isom_sample_new();
+	// Reza: What PL stands for?
+	PL = 0;
+	track = 0;
+	// Reza: is_vfr: is variable frame rate?
+	is_vfr = GF_FALSE;
+
+	is_packed = GF_FALSE;
+	nbDummy = nbNotCoded = nbI = nbP = nbB = max_b = 0;
+	has_cts_offset = GF_FALSE;
+	cur_samp = b_frames = ref_frame = 0;
+
+	is_init = GF_FALSE;
+
+	// allocate video frame
+	picture = av_frame_alloc();
+
+	// read frames
+	i = 0; size = 0; packet_offset = 0;
+	while (av_read_frame(iformat_ctx, &packet) >= 0) {
+		// check if the packet belongs to the video stream
+		if (packet.stream_index == vstream) {
+			// check if we got a frame
+			size += avcodec_decode_video2(codec_ctx, picture, &frame_finished, &packet);
+			if (size > max_size) {
+				frame = (char*)gf_realloc(frame, sizeof(char) * (size_t)size);
+				memcpy(frame + packet_offset, packet.data, packet.size);
+				max_size = size;
+			}
+
+			// check if the video frame is complete
+			if (frame_finished)
+			{
+				i++;
+				size = 0;
+				packet_offset = 0;
+			}
+
+		}
+		av_free_packet(&packet);
+	}
+	printf("Number of frames: %d\n", i);
+
+
+	//	for (i = 0; i < num_samples; i++) {
+	//
+	//		/*get DSI*/
+	//		if (!is_init) {
+	//			is_init = GF_TRUE;
+	//			vparse = gf_m4v_parser_new(frame, size, GF_FALSE);
+	//			e = gf_m4v_parse_config(vparse, &dsi);
+	//			PL = dsi.VideoPL;
+	//			if (!PL) {
+	//				PL = 0x01;
+	//				erase_pl = GF_TRUE;
+	//			}
+	//			samp_offset = gf_m4v_get_object_start(vparse);
+	//			assert(samp_offset < 1 << 31);
+	//			gf_m4v_parser_del(vparse);
+	//			if (e) {
+	//				gf_import_message(import, e, "Cannot import decoder config in first frame");
+	//				goto exit;
+	//			}
+	//
+	//			if (!import->esd) {
+	//				import->esd = gf_odf_desc_esd_new(0);
+	//				destroy_esd = GF_TRUE;
+	//			}
+	//			track = gf_isom_new_track(import->dest, import->esd->ESID, GF_ISOM_MEDIA_VISUAL, timescale);
+	//			if (!track) {
+	//				e = gf_isom_last_error(import->dest);
+	//				goto exit;
+	//			}
+	//			gf_isom_set_track_enabled(import->dest, track, 1);
+	//			if (!import->esd->ESID) import->esd->ESID = gf_isom_get_track_id(import->dest, track);
+	//			import->final_trackID = gf_isom_get_track_id(import->dest, track);
+	//
+	//			if (!import->esd->slConfig) import->esd->slConfig = (GF_SLConfig *)gf_odf_desc_new(GF_ODF_SLC_TAG);
+	//			import->esd->slConfig->timestampResolution = timescale;
+	//
+	//			if (!import->esd->decoderConfig) import->esd->decoderConfig = (GF_DecoderConfig *)gf_odf_desc_new(GF_ODF_DCD_TAG);
+	//			if (import->esd->decoderConfig->decoderSpecificInfo) gf_odf_desc_del((GF_Descriptor *)import->esd->decoderConfig->decoderSpecificInfo);
+	//			import->esd->decoderConfig->decoderSpecificInfo = (GF_DefaultDescriptor *)gf_odf_desc_new(GF_ODF_DSI_TAG);
+	//			import->esd->decoderConfig->streamType = GF_STREAM_VISUAL;
+	//			import->esd->decoderConfig->objectTypeIndication = GPAC_OTI_VIDEO_MPEG4_PART2;
+	//			import->esd->decoderConfig->decoderSpecificInfo->data = (char *)gf_malloc(sizeof(char) * (size_t)samp_offset);
+	//			memcpy(import->esd->decoderConfig->decoderSpecificInfo->data, frame, sizeof(char) * (size_t)samp_offset);
+	//			import->esd->decoderConfig->decoderSpecificInfo->dataLength = (u32)samp_offset;
+	//
+	//			gf_isom_set_cts_packing(import->dest, track, GF_TRUE);
+	//
+	//			/*remove packed flag if any (VOSH user data)*/
+	//			while (1) {
+	//				char *divx_mark;
+	//				while ((i + 3 < samp_offset) && ((frame[i] != 0) || (frame[i + 1] != 0) || (frame[i + 2] != 1))) i++;
+	//				if (i + 4 >= samp_offset) break;
+	//
+	//				if (strncmp(frame + i + 4, "DivX", 4)) {
+	//					i += 4;
+	//					continue;
+	//				}
+	//				divx_mark = import->esd->decoderConfig->decoderSpecificInfo->data + i + 4;
+	//				divx_mark = strchr(divx_mark, 'p');
+	//				if (divx_mark) divx_mark[0] = 'n';
+	//				break;
+	//			}
+	//			i = 0;
+	//
+	//			e = gf_isom_new_mpeg4_description(import->dest, track, import->esd, (import->flags & GF_IMPORT_USE_DATAREF) ? import->in_name : NULL, NULL, &di);
+	//			if (e) goto exit;
+	//			gf_isom_set_visual_info(import->dest, track, di, dsi.width, dsi.height);
+	//			gf_import_message(import, GF_OK, "AVI %s video import - %d x %d @ %02.4f FPS - %d Frames\nIndicated Profile: %s", comp, dsi.width, dsi.height, FPS, num_samples, gf_m4v_get_profile_name((u8)PL));
+	//
+	//			gf_media_update_par(import->dest, track);
+	//		}
+	//
+	//
+	//		if (size > samp_offset) {
+	//			u8 ftype;
+	//			u32 tinc;
+	//			u64 framesize, frame_start;
+	//			u64 file_offset;
+	//			Bool is_coded;
+	//
+	//			size -= samp_offset;
+	//			file_offset = (u64)AVI_get_video_position(in, i);
+	//
+	//			vparse = gf_m4v_parser_new(frame + samp_offset, size, GF_FALSE);
+	//
+	//			samp->dataLength = 0;
+	//			/*removing padding frames*/
+	//			if (size < 4) {
+	//				nbDummy++;
+	//				size = 0;
+	//			}
+	//
+	//			nb_f = 0;
+	//			while (size) {
+	//				GF_Err e = gf_m4v_parse_frame(vparse, dsi, &ftype, &tinc, &framesize, &frame_start, &is_coded);
+	//				if (e < 0) goto exit;
+	//
+	//				if (!is_coded) {
+	//					if (!gf_m4v_is_valid_object_type(vparse)) gf_import_message(import, GF_OK, "WARNING: AVI frame %d doesn't look like MPEG-4 Visual", i + 1);
+	//					nbNotCoded++;
+	//					if (!is_packed) {
+	//						is_vfr = GF_TRUE;
+	//						/*policy is to import at constant frame rate from AVI*/
+	//						if (import->flags & GF_IMPORT_NO_FRAME_DROP) goto proceed;
+	//						/*policy is to import at variable frame rate from AVI*/
+	//						samp->DTS += dts_inc;
+	//					}
+	//					/*assume this is packed bitstream n-vop and discard it.*/
+	//				}
+	//				else {
+	//				proceed:
+	//					if (e == GF_EOS) size = 0;
+	//					else is_packed = GF_TRUE;
+	//					nb_f++;
+	//
+	//					samp->IsRAP = RAP_NO;
+	//
+	//					if (ftype == 2) {
+	//						b_frames++;
+	//						nbB++;
+	//						/*adjust CTS*/
+	//						if (!has_cts_offset) {
+	//							u32 i;
+	//							for (i = 0; i < gf_isom_get_sample_count(import->dest, track); i++) {
+	//								gf_isom_modify_cts_offset(import->dest, track, i + 1, dts_inc);
+	//							}
+	//							has_cts_offset = GF_TRUE;
+	//						}
+	//					}
+	//					else {
+	//						if (!ftype) {
+	//							samp->IsRAP = RAP;
+	//							nbI++;
+	//						}
+	//						else {
+	//							nbP++;
+	//						}
+	//						/*even if no out-of-order frames we MUST adjust CTS if cts_offset is present is */
+	//						if (ref_frame && has_cts_offset)
+	//							gf_isom_modify_cts_offset(import->dest, track, ref_frame, (1 + b_frames)*dts_inc);
+	//
+	//						ref_frame = cur_samp + 1;
+	//						if (max_b < b_frames) max_b = b_frames;
+	//						b_frames = 0;
+	//					}
+	//					/*frame_start indicates start of VOP (eg we always remove VOL from each I)*/
+	//					samp->data = frame + samp_offset + frame_start;
+	//					assert(framesize < 1 << 31);
+	//					samp->dataLength = (u32)framesize;
+	//
+	//					if (import->flags & GF_IMPORT_USE_DATAREF) {
+	//						samp->data = NULL;
+	//						e = gf_isom_add_sample_reference(import->dest, track, di, samp, file_offset + samp_offset + frame_start);
+	//					}
+	//					else {
+	//						e = gf_isom_add_sample(import->dest, track, di, samp);
+	//					}
+	//					cur_samp++;
+	//					samp->DTS += dts_inc;
+	//					if (e) {
+	//						gf_import_message(import, GF_OK, "Error importing AVI frame %d", i + 1);
+	//						goto exit;
+	//					}
+	//				}
+	//				if (!size || (size == framesize + frame_start)) break;
+	//			}
+	//			gf_m4v_parser_del(vparse);
+	//			if (nb_f > 2) gf_import_message(import, GF_OK, "Warning: more than 2 frames packed together");
+	//		}
+	//		samp_offset = 0;
+	//		gf_set_progress("Importing AVI Video", i, num_samples);
+	//		if (duration && (samp->DTS > duration)) break;
+	//		if (import->flags & GF_IMPORT_DO_ABORT)
+	//			break;
+	//	}
+	//
+	//	/*final flush*/
+	//	if (ref_frame && has_cts_offset)
+	//		gf_isom_modify_cts_offset(import->dest, track, ref_frame, (1 + b_frames)*dts_inc);
+	//
+	//	gf_set_progress("Importing AVI Video", num_samples, num_samples);
+	//
+	//
+	//	num_samples = gf_isom_get_sample_count(import->dest, track);
+	//	if (has_cts_offset) {
+	//		gf_import_message(import, GF_OK, "Has B-Frames (%d max consecutive B-VOPs%s)", max_b, is_packed ? " - packed bitstream" : "");
+	//		/*repack CTS tables and adjust offsets for B-frames*/
+	//		gf_isom_set_cts_packing(import->dest, track, GF_FALSE);
+	//
+	//		if (!(import->flags & GF_IMPORT_NO_EDIT_LIST))
+	//			update_edit_list_for_bframes(import->dest, track);
+	//
+	//		/*this is plain ugly but since some encoders (divx) don't use the video PL correctly
+	//		we force the system video_pl to ASP@L5 since we have I, P, B in base layer*/
+	//		if (PL <= 3) {
+	//			PL = 0xF5;
+	//			erase_pl = GF_TRUE;
+	//			gf_import_message(import, GF_OK, "WARNING: indicated profile doesn't include B-VOPs - forcing %s", gf_m4v_get_profile_name((u8)PL));
+	//		}
+	//		gf_import_message(import, GF_OK, "Import results: %d VOPs (%d Is - %d Ps - %d Bs)", num_samples, nbI, nbP, nbB);
+	//	}
+	//	else {
+	//		/*no B-frames, remove CTS offsets*/
+	//		gf_isom_remove_cts_info(import->dest, track);
+	//		gf_import_message(import, GF_OK, "Import results: %d VOPs (%d Is - %d Ps)", num_samples, nbI, nbP);
+	//	}
+	//
+	//	samp->data = NULL;
+	//	gf_isom_sample_del(&samp);
+	//
+	//	if (erase_pl) {
+	//		gf_m4v_rewrite_pl(&import->esd->decoderConfig->decoderSpecificInfo->data, &import->esd->decoderConfig->decoderSpecificInfo->dataLength, (u8)PL);
+	//		gf_isom_change_mpeg4_description(import->dest, track, 1, import->esd);
+	//	}
+	//	gf_media_update_bitrate(import->dest, track);
+	//
+	//	if (is_vfr) {
+	//		if (nbB) {
+	//			if (is_packed) gf_import_message(import, GF_OK, "Warning: Mix of non-coded frames: packed bitstream and encoder skiped - unpredictable timing");
+	//		}
+	//		else {
+	//			if (import->flags & GF_IMPORT_NO_FRAME_DROP) {
+	//				if (nbNotCoded) gf_import_message(import, GF_OK, "Stream has %d N-VOPs", nbNotCoded);
+	//			}
+	//			else {
+	//				gf_import_message(import, GF_OK, "import using Variable Frame Rate - Removed %d N-VOPs", nbNotCoded);
+	//			}
+	//			nbNotCoded = 0;
+	//		}
+	//	}
+	//
+	//	if (nbDummy || nbNotCoded) gf_import_message(import, GF_OK, "Removed Frames: %d VFW delay frames - %d N-VOPs", nbDummy, nbNotCoded);
+	//	gf_isom_set_pl_indication(import->dest, GF_ISOM_PL_VISUAL, (u8)PL);
+	//
+	//exit:
+	//	if (destroy_esd) {
+	//		gf_odf_desc_del((GF_Descriptor *)import->esd);
+	//		import->esd = NULL;
+	//	}
+	//	if (frame) gf_free(frame);
+	//	AVI_close(in);
+	//	return e;
+
+exit:
+	// Reza: The 'free' list is not complete. For some objects I don't know the name of the proper function
+	// from FFmpeg to free the memory properly. I'll come back to this later.
+	//av_free_packet(&packet);
+	if (picture != NULL) av_frame_free(picture);
+	if (codec_ctx != NULL) avcodec_close(codec_ctx);
+	if (codec_ctx_origin != NULL) avcodec_close(codec_ctx_origin);
+	if (iformat_ctx != NULL) avformat_close_input(&iformat_ctx);
+	return e;
+
+}
+
+static GF_Err gf_import_matroska_3dvideo(GF_MediaImporter *import)
+{
+	GF_Err e = GF_OK;
+	return e;
+}
+
+static GF_Err gf_import_matroska_audio(GF_MediaImporter *import)
+{
+	GF_Err e = GF_OK;
+	return e;
+}
+
+static GF_Err gf_import_matroska_subtitle(GF_MediaImporter *import)
+{
+	GF_Err e = GF_OK;
+	return e;
+}
+
+static GF_Err gf_import_webm_video(GF_MediaImporter *import)
+{
+	GF_Err e = GF_OK;
+	return e;
+}
+
+static GF_Err gf_import_webm_audio(GF_MediaImporter *import)
+{
+	GF_Err e = GF_OK;
+	return e;
+}
+
+static GF_Err gf_import_webm_subtitle(GF_MediaImporter *import)
+{
+	GF_Err e = GF_OK;
+	return e;
+}
+#endif /* GPAC_DISABLE_MATROSKA */
 
 GF_Err gf_import_isomedia(GF_MediaImporter *import)
 {
@@ -9519,6 +10064,29 @@ GF_Err gf_media_import(GF_MediaImporter *importer)
 		return gf_import_avi_audio(importer);
 	}
 #endif
+
+#ifndef GPAC_DISABLE_MATROSKA
+	/*Matroska audio/video/subtitle*/
+	if (!strnicmp(ext, ".mkv", 4) || !stricmp(fmt, "MKV")) {
+		e = gf_import_matroska_video(importer);
+		if (e) return e;
+		return gf_import_matroska_audio(importer);
+	}
+	if (!strnicmp(ext, ".webm", 5) || !stricmp(fmt, "WEBM")) {
+		e = gf_import_webm_video(importer);
+		if (e) return e;
+		return gf_import_webm_audio(importer);
+	}
+	if (!strnicmp(ext, ".mk3d", 5) || !stricmp(fmt, "MK3D")) {
+		e = gf_import_matroska_3dvideo(importer);
+		if (e) return e;
+		return gf_import_matroska_audio(importer);
+	}
+	if (!strnicmp(ext, ".mka", 4) || !stricmp(fmt, "MKA"))
+		return gf_import_matroska_audio(importer);
+	if (!strnicmp(ext, ".mks", 4) || !stricmp(fmt, "MKS"))
+		return gf_import_matroska_subtitle(importer);
+#endif /* GPAC_DISABLE_MATROSKA */
 
 #ifndef GPAC_DISABLE_OGG
 	/*OGG audio/video*/

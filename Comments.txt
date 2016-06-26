@@ -1,0 +1,33 @@
+Hi Reza,
+Regarding your comments:
+- the trackID test comes from the AVI importer, I don't think you need it here, you'd rather need a test to see if the requested trackID (if any) matches one of the stream ID in the demux container
+- I think the list of codecs should be checked as it is right now, otherwise we may import codecs for wich there is no official storage in ISOBMF
+- for the duration, IIRC  ffmpeg demux context uses microsecond, so you should divide by 1000 to get to milliseconds. Moreover, the duration in the importer structure is a target import duration , NOT the duration of the stream. It is used to specify how many milliseconds of media we want to import (we could have used double but that doesn't make a lot of difference). This means you have to change in a few places how you use duration 
+- is_vfr: is variable frame rate? : yes but you shouldn't need that since ffmpeg gives you directly the timestamps of video and audio frames. It was needed for AVI where the frames don't have timestamp, only a count.
+ 
+Like Romain, I'm not sure why you try de decode the video at import time, we should only import it, eg build an GF_ISOSample and fill it with data. The best way to detect the end of the frame if you're unsure is to check the value of the timestamps of the coded frame, as returned by av_read_frame; cf:
+https://github.com/gpac/gpac/blob/master/modules/ffmpeg_in/ffmpeg_demux.c#L107
+ 
+Regarding bytestream format for H264, what does the MKV spec says ? Is is stored in AnnexB format (eg with 0x00000001 or 0x000001 start codes for each nal) or do they have their own ways of storing it ?
+ 
+Jean
+
+========================
+
+Interesting pieces for Cyril and Jean:
+fct: https://github.com/gpac/gpac/compare/master...mrzakeri:master#diff-9acd748bb8419a5f7c1d3e913fc9527eR2022
+decode: https://github.com/gpac/gpac/compare/master...mrzakeri:master#diff-9acd748bb8419a5f7c1d3e913fc9527eR2252
+ 
+I am not sure we need to decode. A demux-only example can be found at: https://github.com/gpac/signals/blob/master/src/lib_media/demux/libav_demux.cpp#L123
+ 
+My investigation while making Signals showed me that libavformat can expose the data in different bitstream formats e.g. for h264:
+- annex B when the input is TS
+- canonical (mp4) when the input is mp4
+- ??? format for WebM/MKV?
+ 
+FFmpeg provides bitstreams conversion (in libavfilter IIRC) but I don't know how to make the detection based on FFmpeg structures.
+ 
+We could imagine that your work would limit to H264 video at first. Would it make sense? How familiar are you the issue of bitstream formats?
+ 
+Cheers,
+Romain Bouqueau
